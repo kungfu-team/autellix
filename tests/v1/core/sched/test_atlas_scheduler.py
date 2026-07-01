@@ -516,6 +516,16 @@ def test_missing_program_id_does_not_crash_and_is_per_request():
     assert solo is not None
     assert solo.max_critical_path == 2.0  # max(0, 0 + 2)
 
+    # extra_args present but without a program_id key → same graceful fallback.
+    partial = make_request(
+        "solo2", program_id=None, with_extra_args=True, max_tokens=2, arrival_time=2.0
+    )
+    assert partial.sampling_params.extra_args == {}
+    scheduler.add_request(partial)
+    assert partial.priority == 0
+    _run_to_completion(scheduler, "solo2")
+    assert scheduler.process_table.get("solo2").max_critical_path == 2.0
+
 
 # --------------------------------------------------------------------------- #
 # Gate: thread_id is optional metadata (captured, never branched on)
@@ -631,3 +641,39 @@ def test_normal_completion_then_abort_does_not_double_fold():
     # is not re-applied on the repeat (idempotency).
     scheduler._fold_completed_calls(["dc"], time.time())
     assert scheduler.process_table.get("DC").max_critical_path == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Decode-step proxy under chunked prefill
+# --------------------------------------------------------------------------- #
+
+
+def test_chunked_prefill_accrues_only_on_decode_steps():
+    """Non-final prefill chunks accrue no service; decode steps each add one."""
+    scheduler = create_atlas_scheduler(
+        max_num_seqs=1,
+        long_prefill_token_threshold=8,  # cap prefill at 8 tokens/step
+        max_model_len=256,
+    )
+    call = make_request(
+        "cp", program_id="CP", num_tokens=20, max_tokens=3, arrival_time=1.0
+    )
+    scheduler.add_request(call)
+
+    # Drive the prefill chunks: service must stay 0 while still prefilling.
+    prefill_chunk_steps = 0
+    while True:
+        _step(scheduler)
+        if scheduler.requests["cp"].is_prefill_chunk:
+            prefill_chunk_steps += 1
+            assert scheduler.attained_service.get("cp") == 0.0
+        else:
+            break
+    assert prefill_chunk_steps >= 1, "prompt was not chunked across steps"
+    # The step that finishes prefill (and samples the first token) accrues one.
+    assert scheduler.attained_service.get("cp") == 1.0
+
+    # Finish decoding; the folded critical path excludes non-final prefill chunks.
+    _run_to_completion(scheduler, "cp")
+    assert scheduler.process_table.get("CP").max_critical_path == 3.0  # max(0, 0 + 3)
+    assert call.num_output_tokens == 3
