@@ -43,12 +43,12 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.attained_service import AttainedServiceTracker
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
 from vllm.v1.core.sched.autellix.process_table import ProcessTable
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -67,17 +67,25 @@ _THRESHOLDS = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 _PROGRAM_TTL_S = 600.0
 
 
-class ATLASScheduler(Scheduler):
-    """Critical-path LAS scheduler for multi-threaded agentic programs."""
+class ATLASScheduler(AsyncScheduler):
+    """Critical-path LAS scheduler for multi-threaded agentic programs.
+
+    Subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
+    scheduling enabled; the accrual/fold overrides compose with the async
+    placeholder bookkeeping exactly as in ``PLASScheduler`` (the max rule folds
+    the same per-call service, which the base async over-schedule guard keeps at
+    one unit per output token), and sync operation is unchanged.
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build the scheduler and self-configure priority ordering.
 
-        Calls the base initialiser, then switches the scheduling policy to
-        ``PRIORITY`` and rebuilds the waiting queues so that deploying with only
-        ``--scheduler-cls ...ATLASScheduler`` yields the right ordering, and
-        instantiates the Phase-0 policy core (process table, attained-service
-        tracker, MLFQ binner) plus the per-call maps.
+        Calls the base initialiser (``AsyncScheduler`` -> ``Scheduler``, which
+        also sets up the async placeholder bookkeeping), then switches the
+        scheduling policy to ``PRIORITY`` and rebuilds the waiting queues so that
+        deploying with only ``--scheduler-cls ...ATLASScheduler`` yields the right
+        ordering, and instantiates the Phase-0 policy core (process table,
+        attained-service tracker, MLFQ binner) plus the per-call maps.
         """
         super().__init__(*args, **kwargs)
 
@@ -152,7 +160,14 @@ class ATLASScheduler(Scheduler):
         super().add_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Accrue one unit of attained service per scheduled decode step."""
+        """Accrue one unit of attained service per scheduled decode step.
+
+        ``super()`` runs first: ``AsyncScheduler`` reserves output placeholders
+        and delegates to ``Scheduler``, which advances computed tokens and sets
+        ``is_prefill_chunk``. We then accrue on the final (non-prefill-chunk)
+        steps; the base async over-schedule guard keeps that at exactly one unit
+        per output token, so the max-rule fold is unchanged by run-ahead.
+        """
         super()._update_after_schedule(scheduler_output)
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(req_id)

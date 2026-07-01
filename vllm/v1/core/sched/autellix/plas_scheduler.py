@@ -26,21 +26,28 @@ queue orders by ``(priority, arrival_time, request_id)``, so least-served
 programs are admitted first and the most-served program's call is the natural
 KV-pressure preemption victim (``max(running, key=(priority, arrival_time))``).
 
-Note: a production variant could subclass ``AsyncScheduler`` to preserve
-async-scheduling throughput; it is kept on ``Scheduler`` here for clarity.
-Fairness across policy lines sharing this base is handled later (Phase 6/7).
+It subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
+scheduling enabled -- a plain ``Scheduler`` subclass triggers the documented
+"async scheduling being disabled" degradation (``config/scheduler.py``). The
+policy overrides compose cleanly with async: ``_update_after_schedule`` calls
+``super()`` first (AsyncScheduler manages ``num_output_placeholders`` and sets
+``is_prefill_chunk``) then accrues service on scheduled decode steps, and the
+base async over-schedule guard keeps that accrual exactly one unit per output
+token. In lockstep (sync) operation the placeholder churn nets to zero, so the
+scheduler still behaves identically. Fairness across policy lines sharing this
+base is handled later (Phase 6/7).
 """
 
 import time
 from collections.abc import Iterable
 from typing import Any
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.attained_service import AttainedServiceTracker
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
 from vllm.v1.core.sched.autellix.process_table import ProcessTable
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -59,17 +66,18 @@ _THRESHOLDS = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 _PROGRAM_TTL_S = 600.0
 
 
-class PLASScheduler(Scheduler):
+class PLASScheduler(AsyncScheduler):
     """Least-attained-service scheduler that is aware of agentic programs."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Build the scheduler and self-configure priority ordering.
 
-        Calls the base initialiser, then switches the scheduling policy to
-        ``PRIORITY`` and rebuilds the waiting queues so that deploying with only
-        ``--scheduler-cls ...PLASScheduler`` yields the right ordering, and
-        instantiates the Phase-0 policy core (process table, attained-service
-        tracker, MLFQ binner).
+        Calls the base initialiser (``AsyncScheduler`` -> ``Scheduler``, which
+        also sets up the async placeholder bookkeeping), then switches the
+        scheduling policy to ``PRIORITY`` and rebuilds the waiting queues so that
+        deploying with only ``--scheduler-cls ...PLASScheduler`` yields the right
+        ordering, and instantiates the Phase-0 policy core (process table,
+        attained-service tracker, MLFQ binner).
         """
         super().__init__(*args, **kwargs)
 
@@ -118,7 +126,14 @@ class PLASScheduler(Scheduler):
         super().add_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Accrue one unit of attained service per scheduled decode step."""
+        """Accrue one unit of attained service per scheduled decode step.
+
+        ``super()`` runs first: ``AsyncScheduler`` reserves output placeholders
+        and delegates to ``Scheduler``, which advances computed tokens and sets
+        ``is_prefill_chunk``. We then accrue on the final (non-prefill-chunk)
+        steps. The base async over-schedule guard means the number of such steps
+        stays exactly ``max_tokens``, so accrual is unchanged by run-ahead.
+        """
         super()._update_after_schedule(scheduler_output)
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(req_id)

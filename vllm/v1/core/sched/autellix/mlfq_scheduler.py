@@ -46,10 +46,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -85,8 +85,15 @@ class _MlfqCallState:
     service_window: int
 
 
-class MLFQScheduler(Scheduler):
-    """FastServe-style preemptive MLFQ scheduler (program-agnostic)."""
+class MLFQScheduler(AsyncScheduler):
+    """FastServe-style preemptive MLFQ scheduler (program-agnostic).
+
+    Subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
+    scheduling enabled; the MLFQ overrides compose with the async placeholder
+    bookkeeping (``_update_after_schedule`` calls ``super()`` first, then charges
+    quantum/service on the final decode steps), and in lockstep (sync) operation
+    the placeholder churn nets to zero so behaviour is unchanged.
+    """
 
     def __init__(
         self,
@@ -99,11 +106,12 @@ class MLFQScheduler(Scheduler):
     ) -> None:
         """Build the scheduler and self-configure priority ordering.
 
-        Calls the base initialiser, then switches the scheduling policy to
-        ``PRIORITY`` and rebuilds the (empty) waiting queues, so deploying with
-        only ``--scheduler-cls ...MLFQScheduler`` yields the right ordering. The
-        MLFQ constants default to the D5 / FastServe values and are accepted as
-        parameters so a ``beta`` / ``K`` ablation is possible.
+        Calls the base initialiser (``AsyncScheduler`` -> ``Scheduler``, which
+        also sets up the async placeholder bookkeeping), then switches the
+        scheduling policy to ``PRIORITY`` and rebuilds the (empty) waiting queues,
+        so deploying with only ``--scheduler-cls ...MLFQScheduler`` yields the
+        right ordering. The MLFQ constants default to the D5 / FastServe values
+        and are accepted as parameters so a ``beta`` / ``K`` ablation is possible.
 
         Args:
             num_queues: Number of feedback queues ``K``.
@@ -236,10 +244,13 @@ class MLFQScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Charge one decode step of quantum/service and demote on exhaustion.
 
-        A running call whose quantum is exhausted is demoted one level and its
-        priority updated in place; this is correct even for a call already
-        running (unlike PLAS, an MLFQ call's queue is not fixed for its
-        lifetime). Non-final prefill chunks are not charged.
+        ``super()`` (``AsyncScheduler`` -> ``Scheduler``) runs first to reserve
+        output placeholders and set ``is_prefill_chunk``. A running call whose
+        quantum is exhausted is then demoted one level and its priority updated in
+        place; this is correct even for a call already running (unlike PLAS, an
+        MLFQ call's queue is not fixed for its lifetime). Non-final prefill chunks
+        are not charged, and the base async over-schedule guard keeps the charge
+        at one unit per output token under run-ahead.
         """
         super()._update_after_schedule(scheduler_output)
         for req_id in scheduler_output.num_scheduled_tokens:
