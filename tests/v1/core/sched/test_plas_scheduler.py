@@ -9,6 +9,8 @@ the scheduler with mocked ``ModelRunnerOutput`` steps, exactly like
 ``tests/v1/core/test_scheduler.py``.
 """
 
+import time
+
 import pytest
 import torch
 
@@ -45,6 +47,8 @@ def _make_vllm_config(
     num_blocks: int,
     block_size: int,
     policy: str,
+    long_prefill_token_threshold: int = 0,
+    max_model_len: int | None = None,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -52,10 +56,13 @@ def _make_vllm_config(
         dtype="float16",
         seed=42,
     )
+    if max_model_len is None:
+        max_model_len = max_num_batched_tokens
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        max_model_len=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        long_prefill_token_threshold=long_prefill_token_threshold,
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=policy,
@@ -99,6 +106,8 @@ def create_plas_scheduler(
     max_num_batched_tokens: int = 8192,
     num_blocks: int = 10000,
     block_size: int = 16,
+    long_prefill_token_threshold: int = 0,
+    max_model_len: int | None = None,
 ) -> PLASScheduler:
     """Build a ``PLASScheduler`` with the stock (FCFS) config default.
 
@@ -111,6 +120,8 @@ def create_plas_scheduler(
         num_blocks=num_blocks,
         block_size=block_size,
         policy="fcfs",
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        max_model_len=max_model_len,
     )
     return PLASScheduler(
         vllm_config=vllm_config,
@@ -476,3 +487,98 @@ def test_completed_call_is_deregistered_from_program():
     _run_to_completion(scheduler, "r_call")
     assert scheduler.process_table.get("R").active_call_ids == set()
     assert "r_call" not in scheduler._req_to_pid
+
+
+# --------------------------------------------------------------------------- #
+# Gate: externally-aborted calls are folded, not leaked
+# --------------------------------------------------------------------------- #
+
+
+def test_abort_mid_flight_folds_service_and_deregisters():
+    """A call aborted mid-flight folds its service and frees all its state.
+
+    Aborts arrive via ``finish_requests`` (client disconnect / timeout), which
+    bypasses ``update_from_output`` -- the next ``schedule()`` resets
+    ``finished_req_ids`` before the fold would run. Without a dedicated hook the
+    program state, req->pid entry, and attained-service entry leak permanently
+    (``active_call_ids`` keeps the aborted id, so the program is never GC'd) and
+    the dropped service wrongly lowers the program's later calls' priority.
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    call = make_request("ab_call", program_id="AB", max_tokens=50, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    # Accrue three decode steps of service, then abort mid-flight.
+    for _ in range(3):
+        _step(scheduler)
+    assert scheduler.attained_service.get("ab_call") == 3.0
+    assert call.status == RequestStatus.RUNNING
+
+    aborted = scheduler.finish_requests("ab_call", RequestStatus.FINISHED_ABORTED)
+    assert ("ab_call", call.client_index) in aborted
+
+    program = scheduler.process_table.get("AB")
+    assert program is not None
+    # (a) accrued service folded into the program.
+    assert program.service == 3.0
+    # (b) req->pid map cleaned up.
+    assert "ab_call" not in scheduler._req_to_pid
+    # (c) attained-service entry popped.
+    assert scheduler.attained_service.get("ab_call") == 0.0
+    # (d) call removed from the program's active set.
+    assert "ab_call" not in program.active_call_ids
+    # (e) the now-idle program is GC-eligible (previously un-evictable).
+    evicted = scheduler.process_table.gc(time.time() + 1e9)
+    assert "AB" in evicted
+    assert scheduler.process_table.get("AB") is None
+
+
+def test_normal_completion_then_abort_does_not_double_fold():
+    """Folding is idempotent: a normal completion is never re-folded by abort."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    call = make_request("dc_call", program_id="DC", max_tokens=3, arrival_time=1.0)
+    scheduler.add_request(call)
+    _run_to_completion(scheduler, "dc_call")
+    assert scheduler.process_table.get("DC").service == 3.0
+
+    # A late abort of the already-finished id is a no-op (the base skips it),
+    # so its service is not double-counted.
+    aborted = scheduler.finish_requests("dc_call", RequestStatus.FINISHED_ABORTED)
+    assert aborted == []
+    assert scheduler.process_table.get("DC").service == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Decode-step proxy under chunked prefill
+# --------------------------------------------------------------------------- #
+
+
+def test_chunked_prefill_accrues_only_on_decode_steps():
+    """Non-final prefill chunks accrue no service; decode steps each add one."""
+    scheduler = create_plas_scheduler(
+        max_num_seqs=1,
+        long_prefill_token_threshold=8,  # cap prefill at 8 tokens/step
+        max_model_len=256,
+    )
+    call = make_request(
+        "cp", program_id="CP", num_tokens=20, max_tokens=3, arrival_time=1.0
+    )
+    scheduler.add_request(call)
+
+    # Drive the prefill chunks: service must stay 0 while still prefilling.
+    prefill_chunk_steps = 0
+    while True:
+        _step(scheduler)
+        if scheduler.requests["cp"].is_prefill_chunk:
+            prefill_chunk_steps += 1
+            assert scheduler.attained_service.get("cp") == 0.0
+        else:
+            break
+    assert prefill_chunk_steps >= 1, "prompt was not chunked across steps"
+    # The step that finishes prefill (and samples the first token) accrues one.
+    assert scheduler.attained_service.get("cp") == 1.0
+
+    # Finish decoding; total service excludes the non-final prefill chunks.
+    _run_to_completion(scheduler, "cp")
+    assert scheduler.process_table.get("CP").service == 3.0
+    assert call.num_output_tokens == 3
