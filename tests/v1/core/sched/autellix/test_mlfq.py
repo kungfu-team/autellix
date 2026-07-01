@@ -5,6 +5,7 @@
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
 
 _SERVICE = st.floats(
@@ -146,6 +147,18 @@ def test_anti_starvation_zero_service_with_wait():
 def test_anti_starvation_zero_service_zero_wait():
     binner = MlfqBinner(num_queues=4, first_quantum=1.0, growth_ratio=2.0)
     assert binner.anti_starvation(total_wait=0.0, total_service=0.0, beta=3.0) is False
+
+
+def test_anti_starvation_zero_service_below_beta_is_not_starving():
+    binner = MlfqBinner(num_queues=4, first_quantum=1.0, growth_ratio=2.0)
+    # T = 0 is floored to 1.0, so the ratio is W / 1.0 = 2.0 < beta = 3.0.
+    assert binner.anti_starvation(total_wait=2.0, total_service=0.0, beta=3.0) is False
+
+
+def test_anti_starvation_small_service_is_floored_to_one():
+    binner = MlfqBinner(num_queues=4, first_quantum=1.0, growth_ratio=2.0)
+    # 0 < T < 1 is floored to 1.0, so 5.0 / max(1.0, 0.5) = 5.0 < beta = 8.0.
+    assert binner.anti_starvation(total_wait=5.0, total_service=0.5, beta=8.0) is False
 
 
 def test_outranks():
