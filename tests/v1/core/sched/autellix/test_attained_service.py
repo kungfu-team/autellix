@@ -4,6 +4,7 @@
 
 from hypothesis import given
 from hypothesis import strategies as st
+
 from vllm.v1.core.sched.autellix.attained_service import AttainedServiceTracker
 
 
@@ -66,9 +67,13 @@ def test_pop_unknown_returns_zero():
 def test_record_step_accumulates_monotonically(amounts):
     tracker = AttainedServiceTracker()
     previous = 0.0
+    expected = 0.0
     for amount in amounts:
         tracker.record_step("r", amount)
         current = tracker.get("r")
         assert current >= previous
         previous = current
-    assert tracker.pop("r") == sum(amounts)
+        # Mirror the tracker's own left-fold so the comparison is bit-exact and
+        # does not depend on float summation order.
+        expected += amount
+    assert tracker.pop("r") == expected
