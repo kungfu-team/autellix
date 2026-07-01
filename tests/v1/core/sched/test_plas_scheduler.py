@@ -547,6 +547,11 @@ def test_normal_completion_then_abort_does_not_double_fold():
     assert aborted == []
     assert scheduler.process_table.get("DC").service == 3.0
 
+    # Folding the same id a second time is guarded by the popped req->pid entry,
+    # so no service is added on the repeat (idempotency).
+    scheduler._fold_completed_calls(["dc_call"], time.time())
+    assert scheduler.process_table.get("DC").service == 3.0
+
 
 # --------------------------------------------------------------------------- #
 # Decode-step proxy under chunked prefill

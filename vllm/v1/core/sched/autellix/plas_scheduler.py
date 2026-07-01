@@ -32,6 +32,7 @@ Fairness across policy lines sharing this base is handled later (Phase 6/7).
 """
 
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from vllm.v1.core.sched.autellix.attained_service import AttainedServiceTracker
@@ -42,7 +43,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 # D5 defaults (POLICY_REFERENCE.md §4): K=7 queues with the boundary set
 # (0, 2, 4, 8, 16, 32, 64, inf); pass the thresholds explicitly since the
@@ -126,29 +127,69 @@ class PLASScheduler(Scheduler):
             if request is not None and not request.is_prefill_chunk:
                 self.attained_service.record_step(req_id)
 
+    def _fold_completed_calls(self, req_ids: Iterable[str], now: float) -> None:
+        """Fold each finished call's attained service into its program.
+
+        Applies the PLAS sum rule, deregisters the call, and garbage collects
+        idle programs. Idempotent per call: once a call's ``req_id -> pid`` entry
+        is popped it is never folded again, so the two completion paths
+        (``update_from_output`` for normal stops, ``finish_requests`` for
+        aborts) never double-count.
+
+        Args:
+            req_ids: The finished calls' request ids.
+            now: The current time, used for completion time and GC.
+        """
+        for req_id in req_ids:
+            program_id = self._req_to_pid.pop(req_id, None)
+            service = self.attained_service.pop(req_id)
+            if program_id is None:
+                continue
+            self.process_table.add_service(program_id, service)
+            self.process_table.complete_call(program_id, req_id, now)
+        self.process_table.gc(now)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        """Fold completed calls' service into their programs (sum rule).
+        """Fold normally-stopped calls' service into their programs (sum rule).
 
         Uses the base's per-step ``finished_req_ids`` (populated by
-        ``_free_request`` and reset at the start of each schedule) as the
-        finished-call signal.
+        ``_free_request`` and reset at the end of each ``schedule`` in
+        ``_update_after_schedule``) as the finished-call signal.
         """
         engine_core_outputs = super().update_from_output(
             scheduler_output, model_runner_output
         )
-        finished_req_ids = self.finished_req_ids
-        if finished_req_ids:
-            now = time.time()
-            for req_id in finished_req_ids:
-                program_id = self._req_to_pid.pop(req_id, None)
-                service = self.attained_service.pop(req_id)
-                if program_id is None:
-                    continue
-                self.process_table.add_service(program_id, service)
-                self.process_table.complete_call(program_id, req_id, now)
-            self.process_table.gc(now)
+        if self.finished_req_ids:
+            self._fold_completed_calls(self.finished_req_ids, time.time())
         return engine_core_outputs
+
+    def finish_requests(
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+    ) -> list[tuple[str, int]]:
+        """Fold externally-aborted calls' service before they are dropped.
+
+        Aborts (client disconnect / timeout) enter here rather than through
+        ``update_from_output``, and the next ``schedule`` clears
+        ``finished_req_ids`` before that fold would run. Folding here prevents
+        the call's program state, ``req_id -> pid`` entry, and attained-service
+        entry from leaking permanently (which would also un-GC the program and
+        drop service that biases the program's later calls).
+
+        Args:
+            request_ids: Ids to finish, or ``None`` to finish all.
+            finished_status: The finished status to apply.
+
+        Returns:
+            The ``(request_id, client_index)`` pairs actually finished by this
+            call, as returned by the base scheduler.
+        """
+        aborted = super().finish_requests(request_ids, finished_status)
+        if aborted:
+            self._fold_completed_calls((req_id for req_id, _ in aborted), time.time())
+        return aborted
