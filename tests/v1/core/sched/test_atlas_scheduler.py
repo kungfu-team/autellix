@@ -39,6 +39,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.autellix.atlas_scheduler import ATLASScheduler
 from vllm.v1.core.sched.autellix.plas_scheduler import PLASScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import PriorityRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -214,7 +215,7 @@ def make_request(
     )
 
 
-def _step(scheduler: Scheduler, token: int = 100) -> "object":
+def _step(scheduler: Scheduler, token: int = 100) -> SchedulerOutput:
     """Run one schedule + mocked model output step; return SchedulerOutput."""
     output = scheduler.schedule()
     req_ids = list(output.num_scheduled_tokens.keys())
