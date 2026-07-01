@@ -10,6 +10,7 @@ the scheduler with mocked ``ModelRunnerOutput`` steps, exactly like
 """
 
 import time
+from collections import deque
 
 import pytest
 import torch
@@ -24,7 +25,9 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.plas_scheduler import PLASScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import PriorityRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -49,6 +52,7 @@ def _make_vllm_config(
     policy: str,
     long_prefill_token_threshold: int = 0,
     max_model_len: int | None = None,
+    async_scheduling: bool = False,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -66,6 +70,7 @@ def _make_vllm_config(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=policy,
+        async_scheduling=async_scheduling,
         watermark=0.0,
     )
     cache_config = CacheConfig(
@@ -108,11 +113,14 @@ def create_plas_scheduler(
     block_size: int = 16,
     long_prefill_token_threshold: int = 0,
     max_model_len: int | None = None,
+    async_scheduling: bool = False,
 ) -> PLASScheduler:
     """Build a ``PLASScheduler`` with the stock (FCFS) config default.
 
     Leaving ``policy`` at its ``"fcfs"`` default proves the scheduler
-    self-configures priority ordering on construction.
+    self-configures priority ordering on construction. ``async_scheduling`` toggles
+    ``SchedulerConfig.async_scheduling`` so the ``AsyncScheduler`` run-ahead code
+    path (output placeholders) is active.
     """
     vllm_config = _make_vllm_config(
         max_num_seqs=max_num_seqs,
@@ -122,6 +130,7 @@ def create_plas_scheduler(
         policy="fcfs",
         long_prefill_token_threshold=long_prefill_token_threshold,
         max_model_len=max_model_len,
+        async_scheduling=async_scheduling,
     )
     return PLASScheduler(
         vllm_config=vllm_config,
@@ -197,7 +206,7 @@ def make_request(
     )
 
 
-def _step(scheduler: Scheduler, token: int = 100) -> "object":
+def _step(scheduler: Scheduler, token: int = 100) -> SchedulerOutput:
     """Run one schedule + mocked model output step; return SchedulerOutput."""
     output = scheduler.schedule()
     req_ids = list(output.num_scheduled_tokens.keys())
@@ -587,3 +596,174 @@ def test_chunked_prefill_accrues_only_on_decode_steps():
     _run_to_completion(scheduler, "cp")
     assert scheduler.process_table.get("CP").service == 3.0
     assert call.num_output_tokens == 3
+
+
+# --------------------------------------------------------------------------- #
+# Async scheduling (run-ahead) harness
+#
+# The sync ``_step`` helper is lockstep (schedule then immediately deliver), so
+# ``num_output_placeholders`` nets to zero every step. To exercise the genuine
+# async path we keep outputs in flight in a deque and only deliver the oldest
+# before scheduling the next, mirroring ``tests/v1/core/test_async_scheduler.py``.
+# --------------------------------------------------------------------------- #
+
+
+def _capture_prefill(scheduler: Scheduler, output: SchedulerOutput) -> dict[str, bool]:
+    """Snapshot each scheduled request's prefill-chunk flag at schedule time."""
+    return {
+        req_id: scheduler.requests[req_id].is_prefill_chunk
+        for req_id in output.num_scheduled_tokens
+        if req_id in scheduler.requests
+    }
+
+
+def _async_model_output(
+    output: SchedulerOutput, prefill_flags: dict[str, bool], token: int = 100
+) -> ModelRunnerOutput:
+    """Mocked output: one sampled token per decode step, none for prefill chunks."""
+    req_ids = list(output.num_scheduled_tokens.keys())
+    sampled = [[token] if not prefill_flags.get(rid, False) else [] for rid in req_ids]
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=sampled,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _run_async(
+    scheduler: Scheduler, token: int = 100, depth: int = 2, max_iters: int = 2000
+) -> None:
+    """Prime a depth-``depth`` async pipeline over all requests, then drain it.
+
+    Scheduling ``depth`` steps before delivering any output forces the scheduler
+    to reserve ``num_output_placeholders`` and run ahead; the drain then delivers
+    each in-flight step and schedules one more until the pipeline empties.
+    """
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(depth):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+
+    iters = 0
+    while sched_outputs:
+        iters += 1
+        if iters > max_iters:
+            raise AssertionError("async pipeline did not drain")
+        output, flags = sched_outputs.popleft()
+        scheduler.update_from_output(output, _async_model_output(output, flags, token))
+        nxt = scheduler.schedule()
+        if nxt.num_scheduled_tokens:
+            sched_outputs.append((nxt, _capture_prefill(scheduler, nxt)))
+
+
+# --------------------------------------------------------------------------- #
+# Gate: the scheduler is an AsyncScheduler subclass (async stays ENABLED)
+# --------------------------------------------------------------------------- #
+
+
+def test_plas_is_async_scheduler_subclass():
+    """PLAS subclasses AsyncScheduler, so vLLM keeps async scheduling enabled.
+
+    A ``Scheduler`` (non-async) subclass triggers the documented
+    ``config/scheduler.py`` degradation path ("async scheduling being disabled").
+    """
+    assert issubclass(PLASScheduler, AsyncScheduler)
+    assert isinstance(create_plas_scheduler(), AsyncScheduler)
+    # Async-only bookkeeping the base initialiser must have set up.
+    scheduler = create_plas_scheduler(async_scheduling=True)
+    assert hasattr(scheduler, "_spec_token_placeholders")
+    assert scheduler.pp_size == 1
+
+
+def test_async_scheduling_reserves_output_placeholders():
+    """Running two steps ahead reserves placeholders -- proof async is ENABLED.
+
+    Under a plain ``Scheduler`` base no placeholders are reserved and the second
+    schedule cannot run ahead (it would find nothing to schedule for the
+    in-flight request), so this is the definitive async-vs-degraded check.
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("p", program_id="P", max_tokens=10, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    scheduler.schedule()  # prefill + reserve the first decode's output
+    assert call.num_output_placeholders == 1
+    scheduler.schedule()  # genuinely run one decode step ahead
+    assert call.num_output_placeholders == 2
+    assert call.num_computed_tokens == call.num_prompt_tokens + 1
+
+
+# --------------------------------------------------------------------------- #
+# Gate (async): sum-rule accrual + start-priority inheritance under run-ahead
+# --------------------------------------------------------------------------- #
+
+
+def test_service_accrues_with_sum_rule_under_async():
+    """The decode-step proxy and sum rule are exact under async run-ahead.
+
+    The base async over-schedule guard means #(non-prefill decode steps) still
+    equals max_tokens, so accrual is unchanged by pipelining; the fold happens in
+    the same ``update_from_output`` that delivers the stopping token, so it is
+    neither missed nor doubled.
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1, async_scheduling=True)
+
+    call1 = make_request("p_call1", program_id="P", max_tokens=3, arrival_time=1.0)
+    scheduler.add_request(call1)
+    assert call1.priority == 0  # fresh program => bin(0)
+    _run_async(scheduler)
+    assert call1.num_output_tokens == 3
+    assert scheduler.process_table.get("P").service == 3.0
+
+    # Second call inherits the folded service as its start priority.
+    call2 = make_request("p_call2", program_id="P", max_tokens=2, arrival_time=2.0)
+    scheduler.add_request(call2)
+    assert call2.priority == 1  # bin(3) => queue 1
+    _run_async(scheduler)
+    assert scheduler.process_table.get("P").service == 5.0  # sum rule 3 + 2
+
+
+def test_las_admits_least_served_first_under_async():
+    """LAS ordering (least-served program first) holds with async enabled."""
+    scheduler = create_plas_scheduler(max_num_seqs=1, async_scheduling=True)
+    scheduler.process_table.get_or_create("A").service = 100.0
+
+    scheduler.add_request(make_request("a1", program_id="A", arrival_time=1.0))
+    scheduler.add_request(make_request("b1", program_id="B", arrival_time=2.0))
+
+    output = scheduler.schedule()
+    scheduled = [r.req_id for r in output.scheduled_new_reqs]
+    assert scheduled == ["b1"], "PLAS must admit the least-served program first"
+
+
+def test_abort_mid_flight_folds_service_under_async():
+    """A mid-flight abort under run-ahead folds service exactly once, no leak."""
+    scheduler = create_plas_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("ab", program_id="AB", max_tokens=50, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    # Prime a depth-2 pipeline and deliver a couple of steps (run-ahead active).
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(2):
+        output = scheduler.schedule()
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+    output, flags = sched_outputs.popleft()
+    scheduler.update_from_output(output, _async_model_output(output, flags))
+    assert call.status == RequestStatus.RUNNING
+    accrued = scheduler.attained_service.get("ab")
+    assert accrued >= 1.0
+
+    aborted = scheduler.finish_requests("ab", RequestStatus.FINISHED_ABORTED)
+    assert ("ab", call.client_index) in aborted
+
+    program = scheduler.process_table.get("AB")
+    assert program is not None
+    assert program.service == accrued  # folded exactly once on abort
+    assert "ab" not in scheduler._req_to_pid
+    assert scheduler.attained_service.get("ab") == 0.0
+    assert "ab" not in program.active_call_ids

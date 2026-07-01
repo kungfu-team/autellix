@@ -15,6 +15,8 @@ higher-priority waiting call proactively preempts the worst running call when th
 batch is full. See ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §3-4.
 """
 
+from collections import deque
+
 import pytest
 import torch
 
@@ -28,7 +30,9 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.mlfq_scheduler import MLFQScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import PriorityRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -53,6 +57,7 @@ def _make_vllm_config(
     policy: str,
     long_prefill_token_threshold: int = 0,
     max_model_len: int | None = None,
+    async_scheduling: bool = False,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -70,6 +75,7 @@ def _make_vllm_config(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=policy,
+        async_scheduling=async_scheduling,
         watermark=0.0,
     )
     cache_config = CacheConfig(
@@ -116,12 +122,15 @@ def create_mlfq_scheduler(
     queue_quanta: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),
     beta: float = 8.0,
     max_proactive_preemptions_per_step: int = 1,
+    async_scheduling: bool = False,
 ) -> MLFQScheduler:
     """Build an ``MLFQScheduler`` with the stock (FCFS) config default.
 
     Leaving ``policy`` at its ``"fcfs"`` default proves the scheduler
     self-configures priority ordering on construction. The MLFQ constants are
     forwarded so tests can exercise the tunable-constant (ablation) path.
+    ``async_scheduling`` toggles ``SchedulerConfig.async_scheduling`` so the
+    ``AsyncScheduler`` run-ahead code path is active.
     """
     vllm_config = _make_vllm_config(
         max_num_seqs=max_num_seqs,
@@ -131,6 +140,7 @@ def create_mlfq_scheduler(
         policy="fcfs",
         long_prefill_token_threshold=long_prefill_token_threshold,
         max_model_len=max_model_len,
+        async_scheduling=async_scheduling,
     )
     return MLFQScheduler(
         vllm_config=vllm_config,
@@ -177,7 +187,7 @@ def make_request(
     )
 
 
-def _step(scheduler: Scheduler, token: int = 100) -> "object":
+def _step(scheduler: Scheduler, token: int = 100) -> SchedulerOutput:
     """Run one schedule + mocked model output step; return SchedulerOutput."""
     output = scheduler.schedule()
     req_ids = list(output.num_scheduled_tokens.keys())
@@ -647,3 +657,195 @@ def test_finish_unknown_request_is_a_noop():
 
     assert aborted == []
     assert "keep" in scheduler._call_state
+
+
+# --------------------------------------------------------------------------- #
+# Async scheduling (run-ahead) harness
+#
+# The sync ``_step`` helper is lockstep (schedule then immediately deliver), so
+# ``num_output_placeholders`` nets to zero every step. To exercise the genuine
+# async path we keep outputs in flight in a deque and only deliver the oldest
+# before scheduling the next, mirroring ``tests/v1/core/test_async_scheduler.py``.
+# --------------------------------------------------------------------------- #
+
+
+def _capture_prefill(scheduler: Scheduler, output: SchedulerOutput) -> dict[str, bool]:
+    """Snapshot each scheduled request's prefill-chunk flag at schedule time."""
+    return {
+        req_id: scheduler.requests[req_id].is_prefill_chunk
+        for req_id in output.num_scheduled_tokens
+        if req_id in scheduler.requests
+    }
+
+
+def _async_model_output(
+    output: SchedulerOutput, prefill_flags: dict[str, bool], token: int = 100
+) -> ModelRunnerOutput:
+    """Mocked output: one sampled token per decode step, none for prefill chunks."""
+    req_ids = list(output.num_scheduled_tokens.keys())
+    sampled = [[token] if not prefill_flags.get(rid, False) else [] for rid in req_ids]
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=sampled,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _run_async(
+    scheduler: Scheduler, token: int = 100, depth: int = 2, max_iters: int = 4000
+) -> None:
+    """Prime a depth-``depth`` async pipeline over all requests, then drain it."""
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(depth):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+
+    iters = 0
+    while sched_outputs:
+        iters += 1
+        if iters > max_iters:
+            raise AssertionError("async pipeline did not drain")
+        output, flags = sched_outputs.popleft()
+        scheduler.update_from_output(output, _async_model_output(output, flags, token))
+        nxt = scheduler.schedule()
+        if nxt.num_scheduled_tokens:
+            sched_outputs.append((nxt, _capture_prefill(scheduler, nxt)))
+
+
+# --------------------------------------------------------------------------- #
+# Gate: the scheduler is an AsyncScheduler subclass (async stays ENABLED)
+# --------------------------------------------------------------------------- #
+
+
+def test_mlfq_is_async_scheduler_subclass():
+    """MLFQ subclasses AsyncScheduler, so vLLM keeps async scheduling enabled."""
+    assert issubclass(MLFQScheduler, AsyncScheduler)
+    assert isinstance(create_mlfq_scheduler(), AsyncScheduler)
+    scheduler = create_mlfq_scheduler(async_scheduling=True)
+    assert hasattr(scheduler, "_spec_token_placeholders")
+    assert scheduler.pp_size == 1
+
+
+def test_async_scheduling_reserves_output_placeholders():
+    """Running two steps ahead reserves placeholders -- proof async is ENABLED."""
+    scheduler = create_mlfq_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("d", num_tokens=4, max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    scheduler.schedule()
+    assert call.num_output_placeholders == 1
+    scheduler.schedule()
+    assert call.num_output_placeholders == 2
+
+
+# --------------------------------------------------------------------------- #
+# Gate (async): demotion accounting is preserved with the async base class
+# --------------------------------------------------------------------------- #
+
+
+def test_demotion_accounting_holds_under_async():
+    """Lockstep-under-async matches sync demotion: the placeholder churn is inert.
+
+    Built with ``async_scheduling=True`` (AsyncScheduler base active) but driven
+    with the lockstep ``_step`` helper, so ``num_output_placeholders`` is added in
+    ``_update_after_schedule`` and removed in the paired ``update_from_output``,
+    netting to zero -- the exact per-step demotion accounting is unchanged.
+    """
+    scheduler = create_mlfq_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("d1", num_tokens=4, max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(call)
+    assert call.priority == 0
+
+    _step(scheduler)  # queue 0 quantum == 1 => demote to queue 1
+    assert call.priority == 1
+    assert scheduler._call_state["d1"].quantum_remaining == 2
+    assert scheduler._call_state["d1"].service_window == 1
+
+    _step(scheduler)
+    _step(scheduler)  # queue 1 quantum == 2 => demote to queue 2
+    assert call.priority == 2
+    assert scheduler._call_state["d1"].quantum_remaining == 4
+
+
+def test_long_call_completes_and_releases_state_under_async():
+    """A long call demotes, completes, and frees its state under true run-ahead.
+
+    Driven as a single continuous depth-2 pipeline (no double-priming): demotion
+    is observed mid-drain, and the async over-schedule guard makes the total
+    decode steps exactly ``max_tokens``.
+    """
+    scheduler = create_mlfq_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("d", num_tokens=4, max_tokens=8, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(2):  # prime a depth-2 pipeline
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+
+    demoted = False
+    iters = 0
+    while sched_outputs:
+        iters += 1
+        assert iters < 200
+        output, flags = sched_outputs.popleft()
+        scheduler.update_from_output(output, _async_model_output(output, flags))
+        if "d" in scheduler.requests and scheduler.requests["d"].priority >= 1:
+            demoted = True  # demoted out of Q1 as it accrued service under run-ahead
+        nxt = scheduler.schedule()
+        if nxt.num_scheduled_tokens:
+            sched_outputs.append((nxt, _capture_prefill(scheduler, nxt)))
+
+    assert demoted
+    assert "d" not in scheduler.requests
+    assert call.num_output_tokens == 8  # exact: the async guard caps over-schedule
+    assert "d" not in scheduler._call_state  # released, no leak
+
+
+def test_proactive_preemption_under_async():
+    """A fresh Q1 call preempts the worst running call with async enabled."""
+    scheduler = create_mlfq_scheduler(max_num_seqs=1, async_scheduling=True)
+    low = make_request("low", num_tokens=4, max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(low)
+    for _ in range(7):  # lockstep demote (async churn inert) to queue 3
+        _step(scheduler)
+    assert low.priority == 3
+    assert [r.request_id for r in scheduler.running] == ["low"]
+
+    high = make_request("high", num_tokens=4, max_tokens=5, arrival_time=8.0)
+    scheduler.add_request(high)
+    assert high.priority == 0
+
+    before = scheduler.proactive_preemption_count
+    output = scheduler.schedule()
+
+    assert scheduler.requests["low"].status == RequestStatus.PREEMPTED
+    assert any(r.req_id == "high" for r in output.scheduled_new_reqs)
+    assert scheduler.proactive_preemption_count == before + 1
+
+
+def test_call_state_released_on_abort_under_async():
+    """An externally-aborted call frees its per-call state under run-ahead."""
+    scheduler = create_mlfq_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("ab", num_tokens=4, max_tokens=50, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(2):
+        output = scheduler.schedule()
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+    output, flags = sched_outputs.popleft()
+    scheduler.update_from_output(output, _async_model_output(output, flags))
+    assert call.status == RequestStatus.RUNNING
+
+    aborted = scheduler.finish_requests("ab", RequestStatus.FINISHED_ABORTED)
+    assert ("ab", call.client_index) in aborted
+    assert "ab" not in scheduler._call_state  # no leak
+    assert "ab" not in scheduler.requests

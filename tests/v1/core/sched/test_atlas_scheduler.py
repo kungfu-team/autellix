@@ -23,6 +23,7 @@ starve its siblings, all without any explicit parent/DAG tracking.
 """
 
 import time
+from collections import deque
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.atlas_scheduler import ATLASScheduler
 from vllm.v1.core.sched.autellix.plas_scheduler import PLASScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -64,6 +66,7 @@ def _make_vllm_config(
     policy: str,
     long_prefill_token_threshold: int = 0,
     max_model_len: int | None = None,
+    async_scheduling: bool = False,
 ) -> VllmConfig:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -81,6 +84,7 @@ def _make_vllm_config(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=policy,
+        async_scheduling=async_scheduling,
         watermark=0.0,
     )
     cache_config = CacheConfig(
@@ -123,11 +127,14 @@ def create_atlas_scheduler(
     block_size: int = 16,
     long_prefill_token_threshold: int = 0,
     max_model_len: int | None = None,
+    async_scheduling: bool = False,
 ) -> ATLASScheduler:
     """Build an ``ATLASScheduler`` with the stock (FCFS) config default.
 
     Leaving ``policy`` at its ``"fcfs"`` default proves the scheduler
-    self-configures priority ordering on construction.
+    self-configures priority ordering on construction. ``async_scheduling``
+    toggles ``SchedulerConfig.async_scheduling`` so the ``AsyncScheduler``
+    run-ahead code path is active.
     """
     vllm_config = _make_vllm_config(
         max_num_seqs=max_num_seqs,
@@ -137,6 +144,7 @@ def create_atlas_scheduler(
         policy="fcfs",
         long_prefill_token_threshold=long_prefill_token_threshold,
         max_model_len=max_model_len,
+        async_scheduling=async_scheduling,
     )
     return ATLASScheduler(
         vllm_config=vllm_config,
@@ -677,3 +685,178 @@ def test_chunked_prefill_accrues_only_on_decode_steps():
     _run_to_completion(scheduler, "cp")
     assert scheduler.process_table.get("CP").max_critical_path == 3.0  # max(0, 0 + 3)
     assert call.num_output_tokens == 3
+
+
+# --------------------------------------------------------------------------- #
+# Async scheduling (run-ahead) harness
+#
+# The sync ``_step`` helper is lockstep (schedule then immediately deliver), so
+# ``num_output_placeholders`` nets to zero every step. To exercise the genuine
+# async path we keep outputs in flight in a deque and only deliver the oldest
+# before scheduling the next, mirroring ``tests/v1/core/test_async_scheduler.py``.
+# --------------------------------------------------------------------------- #
+
+
+def _capture_prefill(scheduler: Scheduler, output: SchedulerOutput) -> dict[str, bool]:
+    """Snapshot each scheduled request's prefill-chunk flag at schedule time."""
+    return {
+        req_id: scheduler.requests[req_id].is_prefill_chunk
+        for req_id in output.num_scheduled_tokens
+        if req_id in scheduler.requests
+    }
+
+
+def _async_model_output(
+    output: SchedulerOutput, prefill_flags: dict[str, bool], token: int = 100
+) -> ModelRunnerOutput:
+    """Mocked output: one sampled token per decode step, none for prefill chunks."""
+    req_ids = list(output.num_scheduled_tokens.keys())
+    sampled = [[token] if not prefill_flags.get(rid, False) else [] for rid in req_ids]
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=sampled,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _run_async(
+    scheduler: Scheduler, token: int = 100, depth: int = 2, max_iters: int = 2000
+) -> None:
+    """Prime a depth-``depth`` async pipeline over all requests, then drain it."""
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(depth):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+
+    iters = 0
+    while sched_outputs:
+        iters += 1
+        if iters > max_iters:
+            raise AssertionError("async pipeline did not drain")
+        output, flags = sched_outputs.popleft()
+        scheduler.update_from_output(output, _async_model_output(output, flags, token))
+        nxt = scheduler.schedule()
+        if nxt.num_scheduled_tokens:
+            sched_outputs.append((nxt, _capture_prefill(scheduler, nxt)))
+
+
+def _run_sequential_async(
+    scheduler: Scheduler, program_id: str, calls: list[tuple[str, int]]
+) -> list[int]:
+    """Add + fully complete each call in order under async; return priorities."""
+    priorities: list[int] = []
+    for i, (req_id, max_tokens) in enumerate(calls):
+        request = make_request(
+            req_id,
+            program_id=program_id,
+            max_tokens=max_tokens,
+            arrival_time=float(i + 1),
+        )
+        scheduler.add_request(request)
+        priorities.append(request.priority)
+        _run_async(scheduler)
+    return priorities
+
+
+# --------------------------------------------------------------------------- #
+# Gate: the scheduler is an AsyncScheduler subclass (async stays ENABLED)
+# --------------------------------------------------------------------------- #
+
+
+def test_atlas_is_async_scheduler_subclass():
+    """ATLAS subclasses AsyncScheduler, so vLLM keeps async scheduling enabled."""
+    assert issubclass(ATLASScheduler, AsyncScheduler)
+    assert isinstance(create_atlas_scheduler(), AsyncScheduler)
+    scheduler = create_atlas_scheduler(async_scheduling=True)
+    assert hasattr(scheduler, "_spec_token_placeholders")
+    assert scheduler.pp_size == 1
+
+
+def test_async_scheduling_reserves_output_placeholders():
+    """Running two steps ahead reserves placeholders -- proof async is ENABLED."""
+    scheduler = create_atlas_scheduler(max_num_seqs=1, async_scheduling=True)
+    call = make_request("p", program_id="P", max_tokens=10, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    scheduler.schedule()
+    assert call.num_output_placeholders == 1
+    scheduler.schedule()
+    assert call.num_output_placeholders == 2
+
+
+# --------------------------------------------------------------------------- #
+# Gate (async): max-update rule is exact across sequential calls under run-ahead
+# --------------------------------------------------------------------------- #
+
+
+def test_max_update_rule_under_async():
+    """Sequential completions set max(prev, start + service) exactly under async."""
+    scheduler = create_atlas_scheduler(max_num_seqs=1, async_scheduling=True)
+
+    priorities = _run_sequential_async(
+        scheduler, "P", [("c1", 3), ("c2", 2), ("c3", 4)]
+    )
+    # start 0 -> bin(0)=0; start 3 -> bin(3)=1; start 5 -> bin(5)=2.
+    assert priorities == [0, 1, 2]
+    # max(0,0+3)=3; max(3,3+2)=5; max(5,5+4)=9.
+    assert scheduler.process_table.get("P").max_critical_path == 9.0
+
+
+def test_concurrent_calls_use_max_not_sum_under_async():
+    """Two concurrent siblings push the scalar to M + max(t_a, t_b) under async.
+
+    The defining ATLAS-vs-PLAS divergence must survive run-ahead: program P sits
+    at M = 4; siblings attain t_a = 5 and t_b = 2, so the max rule gives 9 -- not
+    the PLAS sum 11.
+    """
+    scheduler = create_atlas_scheduler(max_num_seqs=4, async_scheduling=True)
+    m = 4.0
+    scheduler.process_table.get_or_create("P").max_critical_path = m
+
+    a = make_request("a", program_id="P", max_tokens=5, arrival_time=1.0)
+    b = make_request("b", program_id="P", max_tokens=2, arrival_time=2.0)
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    assert a.priority == b.priority  # concurrent siblings grouped (both bin(4))
+
+    _run_async(scheduler)  # run both siblings to completion under run-ahead
+
+    max_cp = scheduler.process_table.get("P").max_critical_path
+    assert max_cp == 9.0  # max(4, 4 + 5, 4 + 2)
+    assert max_cp == m + max(5.0, 2.0)  # critical path
+    assert max_cp != m + 5.0 + 2.0  # NOT the PLAS sum (would be 11)
+
+
+def test_abort_folds_max_under_async():
+    """A mid-flight abort under run-ahead folds the max rule exactly once."""
+    scheduler = create_atlas_scheduler(max_num_seqs=1, async_scheduling=True)
+    scheduler.process_table.get_or_create("AB").max_critical_path = 4.0
+    call = make_request("ab", program_id="AB", max_tokens=50, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    sched_outputs: deque[tuple[SchedulerOutput, dict[str, bool]]] = deque()
+    for _ in range(2):
+        output = scheduler.schedule()
+        sched_outputs.append((output, _capture_prefill(scheduler, output)))
+    output, flags = sched_outputs.popleft()
+    scheduler.update_from_output(output, _async_model_output(output, flags))
+    assert call.status == RequestStatus.RUNNING
+    accrued = scheduler.attained_service.get("ab")
+    assert accrued >= 1.0
+
+    aborted = scheduler.finish_requests("ab", RequestStatus.FINISHED_ABORTED)
+    assert ("ab", call.client_index) in aborted
+
+    program = scheduler.process_table.get("AB")
+    assert program is not None
+    # max(4, start(4) + accrued) folded exactly once.
+    assert program.max_critical_path == max(4.0, 4.0 + accrued)
+    assert "ab" not in scheduler._req_to_pid
+    assert "ab" not in scheduler._req_to_start_scalar
+    assert scheduler.attained_service.get("ab") == 0.0
+    assert "ab" not in program.active_call_ids
