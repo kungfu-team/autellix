@@ -100,8 +100,9 @@ class MlfqBinner:
     ) -> bool:
         """Return whether a starving entity should be promoted to the top queue.
 
-        An entity is starving when it has waited without being served, or when
-        its wait-to-service ratio has reached ``beta``.
+        The entity is starving when its wait-to-service ratio reaches ``beta``,
+        with service floored to ``1.0`` so the ratio stays bounded for brand-new
+        calls that have attained little or no service.
 
         Args:
             total_wait: Accumulated waiting time ``W``.
@@ -109,13 +110,9 @@ class MlfqBinner:
             beta: Wait-to-service ratio threshold that triggers promotion.
 
         Returns:
-            ``True`` iff ``total_service <= 0 and total_wait > 0`` (waited but
-            never served), or ``total_service > 0 and total_wait / total_service
-            >= beta``.
+            ``True`` iff ``total_wait / max(1.0, total_service) >= beta``.
         """
-        if total_service <= 0:
-            return total_wait > 0
-        return total_wait / total_service >= beta
+        return total_wait / max(1.0, total_service) >= beta
 
     def outranks(self, waiting_bin: int, running_bin: int) -> bool:
         """Return whether a waiting call sits in a strictly better queue.

@@ -140,7 +140,8 @@ def test_anti_starvation_below_beta():
 
 def test_anti_starvation_zero_service_with_wait():
     binner = MlfqBinner(num_queues=4, first_quantum=1.0, growth_ratio=2.0)
-    # No service yet but waiting -> starving, and no ZeroDivisionError.
+    # T=0 floored to 1.0, so 5.0 / 1.0 = 5.0 >= beta = 3.0 -> starving (the
+    # W >= beta floor case), and no ZeroDivisionError.
     assert binner.anti_starvation(total_wait=5.0, total_service=0.0, beta=3.0) is True
 
 
