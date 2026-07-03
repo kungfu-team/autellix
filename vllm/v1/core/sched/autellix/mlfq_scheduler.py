@@ -171,11 +171,27 @@ class MLFQScheduler(AsyncScheduler):
         The bookkeeping pass (anti-starvation promotion + proactive preemption)
         mutates ``request.priority`` and the waiting heap so that the base loop,
         which is unchanged, admits and evicts calls in MLFQ order.
+
+        Proactive preemptions happen before the base loop, so the base only
+        reports its own KV-pressure preemptions in ``preempted_req_ids``; the
+        proactive victims are merged in afterwards. The v2 model runner frees a
+        request's persistent-batch slot only for ids in ``finished_req_ids`` or
+        ``preempted_req_ids``, and a proactive preemption always happens at a
+        full batch whose vacated slot is immediately re-admitted — so an
+        unreported victim overflows the worker's ``max_num_reqs`` slots
+        ("No free indices"). The worker frees slots before adding new/resumed
+        requests, so reporting a victim resumed in this same step is safe.
         """
         now = time.monotonic()
         self._accrue_wait_and_promote()
-        self._proactively_preempt(now)
-        return super().schedule(throttle_prefills)
+        preempted_req_ids = self._proactively_preempt(now)
+        scheduler_output = super().schedule(throttle_prefills)
+        if preempted_req_ids:
+            if scheduler_output.preempted_req_ids is None:
+                scheduler_output.preempted_req_ids = preempted_req_ids
+            else:
+                scheduler_output.preempted_req_ids |= preempted_req_ids
+        return scheduler_output
 
     def _accrue_wait_and_promote(self) -> None:
         """Accrue wait for waiting calls and promote the starving ones to Q1.
@@ -211,7 +227,7 @@ class MLFQScheduler(AsyncScheduler):
         state.service_window = 0
         request.priority = 0
 
-    def _proactively_preempt(self, now: float) -> None:
+    def _proactively_preempt(self, now: float) -> set[str]:
         """Preempt the worst running call(s) so better waiting calls can run.
 
         Only fires when the batch is full. Each iteration preempts the current
@@ -221,12 +237,16 @@ class MLFQScheduler(AsyncScheduler):
         admit the better waiting calls into the vacated slots. The strict-outrank
         guard makes preemption stop once the queues converge, and the per-step
         cap bounds recompute so it cannot thrash.
+
+        Returns:
+            The preempted request ids, to be merged into the step's
+            ``SchedulerOutput.preempted_req_ids`` (see ``schedule``).
         """
+        preempted_req_ids: set[str] = set()
         if len(self.running) < self.max_num_running_reqs:
-            return
-        freed = 0
+            return preempted_req_ids
         while (
-            freed < self.max_proactive_preemptions_per_step
+            len(preempted_req_ids) < self.max_proactive_preemptions_per_step
             and self.waiting
             and self.running
         ):
@@ -239,7 +259,8 @@ class MLFQScheduler(AsyncScheduler):
             self.running.remove(worst_running)
             self._preempt_request(worst_running, now)
             self.proactive_preemption_count += 1
-            freed += 1
+            preempted_req_ids.add(worst_running.request_id)
+        return preempted_req_ids
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Charge one decode step of quantum/service and demote on exhaustion.
