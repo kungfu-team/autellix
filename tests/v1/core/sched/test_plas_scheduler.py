@@ -531,6 +531,55 @@ def test_completed_call_is_deregistered_from_program():
 
 
 # --------------------------------------------------------------------------- #
+# Gate: wait accrual — a call's waited steps fold into the program's W_p
+# --------------------------------------------------------------------------- #
+
+
+def test_waiting_steps_fold_into_program_total_wait_on_completion():
+    """A call's accrued wait window folds into ProcessTable.total_wait (W_p)."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    # Heavily-served waiter (bin 6): it cannot outrank or promote past the
+    # fresh blocker within this test's horizon, so its wait is deterministic.
+    scheduler.process_table.get_or_create("W").service = 100.0
+
+    blocker = make_request("blk", program_id="B", max_tokens=5, arrival_time=1.0)
+    waiter = make_request("w1", program_id="W", max_tokens=2, arrival_time=2.0)
+    scheduler.add_request(blocker)
+    scheduler.add_request(waiter)
+
+    # Blocker runs 5 decode steps (steps 1-5); the waiter accrues one unit of
+    # wait per schedule() pass while queued, including the pass that admits it.
+    for _ in range(5):
+        _step(scheduler)
+    assert "blk" not in scheduler.requests
+    assert scheduler._call_state["w1"].wait_window == 5
+
+    _run_to_completion(scheduler, "w1")
+
+    assert scheduler.process_table.get("W").total_wait == 6.0  # 5 + admission pass
+
+
+def test_waiting_steps_fold_into_program_total_wait_on_abort():
+    """An aborted waiting call folds its wait window into W_p (no leak)."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    scheduler.process_table.get_or_create("W").service = 100.0
+
+    blocker = make_request("blk", program_id="B", max_tokens=50, arrival_time=1.0)
+    waiter = make_request("w1", program_id="W", max_tokens=2, arrival_time=2.0)
+    scheduler.add_request(blocker)
+    scheduler.add_request(waiter)
+
+    for _ in range(3):
+        _step(scheduler)
+    assert scheduler._call_state["w1"].wait_window == 3
+
+    scheduler.finish_requests("w1", RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler.process_table.get("W").total_wait == 3.0
+    assert "w1" not in scheduler._call_state
+
+
+# --------------------------------------------------------------------------- #
 # Gate: externally-aborted calls are folded, not leaked
 # --------------------------------------------------------------------------- #
 

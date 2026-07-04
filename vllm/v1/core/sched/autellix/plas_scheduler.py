@@ -177,11 +177,12 @@ class PLASScheduler(QuantumMlfqMixin, AsyncScheduler):
     def _fold_completed_calls(self, req_ids: Iterable[str], now: float) -> None:
         """Fold each finished call's attained service into its program.
 
-        Applies the PLAS sum rule, deregisters the call, and garbage collects
-        idle programs. Idempotent per call: once a call's ``req_id -> pid`` entry
-        is popped it is never folded again, so the two completion paths
-        (``update_from_output`` for normal stops, ``finish_requests`` for
-        aborts) never double-count.
+        Applies the PLAS sum rule, folds the call's residual wait window into
+        the program's ``W_p`` (residual because promotion resets ``W_c``),
+        deregisters the call, and garbage collects idle programs. Idempotent
+        per call: once a call's ``req_id -> pid`` entry is popped it is never
+        folded again, so the two completion paths (``update_from_output`` for
+        normal stops, ``finish_requests`` for aborts) never double-count.
 
         Args:
             req_ids: The finished calls' request ids.
@@ -190,10 +191,12 @@ class PLASScheduler(QuantumMlfqMixin, AsyncScheduler):
         for req_id in req_ids:
             program_id = self._req_to_pid.pop(req_id, None)
             service = self.attained_service.pop(req_id)
-            self._call_state.pop(req_id, None)
+            call_state = self._call_state.pop(req_id, None)
             if program_id is None:
                 continue
             self.process_table.add_service(program_id, service)
+            if call_state is not None:
+                self.process_table.add_wait(program_id, call_state.wait_window)
             self.process_table.complete_call(program_id, req_id, now)
         self.process_table.gc(now)
 
