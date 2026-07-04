@@ -835,6 +835,50 @@ def test_v2_worker_slot_accounting_never_overflows_under_churn():
 
 
 # --------------------------------------------------------------------------- #
+# Gate: overload starvation bound — an old program completes under overload
+# --------------------------------------------------------------------------- #
+
+
+def test_old_program_completes_under_sustained_overload():
+    """Under unserviceable load an old program's wait stays ~beta-bounded.
+
+    Same regime as the PLAS overload test but with the ATLAS critical-path
+    scalar: sustained fresh-program arrivals (2 demanded tokens/step) exceed
+    capacity (1 token/step), so a deep-critical-path program (T_p=10, bin 3)
+    first starves behind perpetual bin-0 arrivals and must then be promoted at
+    W ~= beta * T_p and complete (POLICY_REFERENCE.md §6a: without the guard
+    ATLAS starves descended programs with no promotion path to rescue them).
+    """
+    scheduler = create_atlas_scheduler(max_num_seqs=1)
+    scheduler.process_table.get_or_create("OLD").max_critical_path = 10.0
+
+    old_call = make_request("old", program_id="OLD", max_tokens=2, arrival_time=0.0)
+    scheduler.add_request(old_call)
+    assert old_call.priority == 3  # bin(10)
+
+    first_scheduled_step = None
+    completed_step = None
+    for i in range(1, 600):
+        fresh = make_request(
+            f"f{i}", program_id=f"P{i}", max_tokens=2, arrival_time=float(i)
+        )
+        scheduler.add_request(fresh)
+        output = _step(scheduler)
+        if first_scheduled_step is None and "old" in output.num_scheduled_tokens:
+            first_scheduled_step = i
+        if "old" not in scheduler.requests:
+            completed_step = i
+            break
+
+    assert completed_step is not None, "old program starved (never completed)"
+    assert old_call.num_output_tokens == 2
+    # It genuinely starved first: promotion fires at W_c >= beta * T_p = 80
+    # accrual passes, so it cannot have been scheduled much earlier.
+    assert first_scheduled_step is not None
+    assert first_scheduled_step >= 60, "old call ran before the starvation regime"
+
+
+# --------------------------------------------------------------------------- #
 # Decode-step proxy under chunked prefill
 # --------------------------------------------------------------------------- #
 
