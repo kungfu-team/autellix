@@ -361,28 +361,60 @@ def test_service_accrues_with_sum_rule_on_completion():
 
 
 # --------------------------------------------------------------------------- #
-# Gate: priority stability across a call's lifetime
+# Gate: quantum demotion (Algorithm 1 lines 21-24) layered on the arrival bin
 # --------------------------------------------------------------------------- #
 
 
-def test_call_priority_is_stable_through_lifetime():
-    """A call's priority is fixed at arrival and never changes mid-call."""
+def test_fresh_call_demotes_one_level_after_each_queue_quantum():
+    """A fresh call walks down the queue ladder as it exhausts each quantum."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    call = make_request("d1", program_id="D", max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(call)
+    assert call.priority == 0  # fresh program => bin(0)
+
+    # Queue 0 quantum == 1: a single decode step demotes to queue 1.
+    _step(scheduler)
+    assert call.priority == 1
+    assert scheduler._call_state["d1"].quantum_remaining == 2  # queue_quanta[1]
+
+    # Queue 1 quantum == 2: two decode steps demote to queue 2.
+    _step(scheduler)
+    assert call.priority == 1
+    _step(scheduler)
+    assert call.priority == 2
+    assert scheduler._call_state["d1"].quantum_remaining == 4  # queue_quanta[2]
+
+
+def test_call_starts_at_arrival_bin_with_that_bins_quantum():
+    """The arrival bin (program service) sets both the level and the quantum."""
     scheduler = create_plas_scheduler(max_num_seqs=1)
     scheduler.process_table.get_or_create("Q").service = 5.0
 
-    call = make_request("q_call", program_id="Q", max_tokens=6, arrival_time=1.0)
+    call = make_request("q_call", program_id="Q", max_tokens=200, arrival_time=1.0)
     scheduler.add_request(call)
-    initial_priority = call.priority
-    assert initial_priority == 2  # bin(5)
+    assert call.priority == 2  # bin(5)
+    assert scheduler._call_state["q_call"].quantum_remaining == 4  # queue_quanta[2]
 
-    seen = set()
-    for _ in range(50):
-        if "q_call" not in scheduler.requests:
-            break
+    # Queue 2 quantum == 4: four decode steps demote to queue 3.
+    for _ in range(4):
         _step(scheduler)
-        seen.add(call.priority)
-    assert seen == {initial_priority}, "priority must not change mid-call"
-    assert call.priority == initial_priority
+    assert call.priority == 3
+    assert scheduler._call_state["q_call"].quantum_remaining == 8  # queue_quanta[3]
+
+
+def test_demotion_saturates_at_bottom_queue():
+    """Demotion never moves a call past the last queue (index K-1)."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    call = make_request("s1", program_id="S", max_tokens=300, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    # 1 + 2 + 4 + 8 + 16 + 32 == 63 decode steps reach the bottom queue.
+    for _ in range(63):
+        _step(scheduler)
+    assert call.priority == 6
+    for _ in range(64):  # exhausting the bottom quantum keeps it there
+        _step(scheduler)
+    assert call.priority == 6
 
 
 # --------------------------------------------------------------------------- #

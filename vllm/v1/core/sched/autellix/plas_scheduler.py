@@ -4,47 +4,51 @@
 
 PLAS groups a program's many LLM calls (keyed by ``program_id``) and schedules
 least-served programs first, so short interactive programs are not starved
-behind long-running ones. It is the minimal faithful realisation of the paper's
-PLAS policy (§4.2, Eq. 1) on the vLLM v1 engine: it composes the pure-Python
-Phase-0 policy core with vLLM's native priority queue and recompute-based
-preemption.
+behind long-running ones. It realises the paper's program-aware scheduler
+(§4.2, Eq. 1 + Algorithm 1) on the vLLM v1 engine: it composes the pure-Python
+policy core with vLLM's native priority queue and recompute-based preemption.
 
-Mapping (see ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §5):
+Mapping (see ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §5 and §6a):
 
 * On arrival a call inherits its program's cumulative attained service as its
-  start priority, discretised into one of the MLFQ bins. The bin is written to
-  ``request.priority`` and is **stable for the call's lifetime** -- this
-  scheduler performs no demotion or anti-starvation promotion (that is Phase 2's
-  ``MLFQScheduler``).
+  start level, discretised into one of the MLFQ bins and written to
+  ``request.priority`` (an int queue level, 0 = top; the native priority queue
+  orders by ``(priority, arrival_time, request_id)``, so levels are primary and
+  FCFS breaks ties within a level).
+* Algorithm 1's per-call mechanics (via :class:`QuantumMlfqMixin`) then layer
+  on top of the arrival bin: the call demotes one level whenever it exhausts
+  its level's decode-step quantum (lines 21-24); a waiting call accrues
+  ``W_c`` and is promoted back to the top level when the **program-level**
+  starvation ratio ``(W_p + W_c) / max(1, T_p + T_c)`` reaches ``beta``
+  (lines 25-31), resetting only the call-level windows; and a strictly-better
+  waiting call proactively preempts the worst running call when the batch is
+  full (bounded per step).
 * Attained service is proxied by decode steps: each scheduled decode step adds
   one unit (§2, D4).
 * On completion a call's accrued service is folded into its program with the
-  PLAS **sum** rule, and idle programs are garbage collected by TTL.
-
-Smaller ``request.priority`` means higher priority, and the native priority
-queue orders by ``(priority, arrival_time, request_id)``, so least-served
-programs are admitted first and the most-served program's call is the natural
-KV-pressure preemption victim (``max(running, key=(priority, arrival_time))``).
+  PLAS **sum** rule and its residual wait window is folded into the program's
+  ``W_p``; idle programs are garbage collected by TTL.
 
 It subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
 scheduling enabled -- a plain ``Scheduler`` subclass triggers the documented
 "async scheduling being disabled" degradation (``config/scheduler.py``). The
-policy overrides compose cleanly with async: ``_update_after_schedule`` calls
-``super()`` first (AsyncScheduler manages ``num_output_placeholders`` and sets
-``is_prefill_chunk``) then accrues service on scheduled decode steps, and the
-base async over-schedule guard keeps that accrual exactly one unit per output
-token. In lockstep (sync) operation the placeholder churn nets to zero, so the
-scheduler still behaves identically. Fairness across policy lines sharing this
-base is handled later (Phase 6/7).
+policy overrides compose cleanly with async: the mixin's
+``_update_after_schedule`` calls ``super()`` first (AsyncScheduler manages
+``num_output_placeholders`` and sets ``is_prefill_chunk``) then charges quantum
+and accrues service on the final (non-prefill-chunk) steps, and the base async
+over-schedule guard keeps that accrual exactly one unit per output token. In
+lockstep (sync) operation the placeholder churn nets to zero, so the scheduler
+still behaves identically.
 """
 
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.attained_service import AttainedServiceTracker
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
+from vllm.v1.core.sched.autellix.policy_core import QuantumMlfqMixin
 from vllm.v1.core.sched.autellix.process_table import ProcessTable
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -53,10 +57,14 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 # D5 defaults (POLICY_REFERENCE.md §4): K=7 queues with the boundary set
-# (0, 2, 4, 8, 16, 32, 64, inf); pass the thresholds explicitly since the
-# geometric default is not the D5 boundary set.
+# (0, 2, 4, 8, 16, 32, 64, inf) for arrival binning; pass the thresholds
+# explicitly since the geometric default is not the D5 boundary set. The
+# per-queue decode-step quanta and beta follow the FastServe scheme.
 _NUM_QUEUES = 7
 _THRESHOLDS = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+_QUEUE_QUANTA: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+_BETA = 8.0
+_MAX_PROACTIVE_PREEMPTIONS_PER_STEP = 1
 
 # Seconds an idle program (no in-flight calls, no recent completion) may live
 # before its state is evicted. Agentic programs issue bursts of calls separated
@@ -66,18 +74,43 @@ _THRESHOLDS = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 _PROGRAM_TTL_S = 600.0
 
 
-class PLASScheduler(AsyncScheduler):
+class PLASScheduler(QuantumMlfqMixin, AsyncScheduler):
     """Least-attained-service scheduler that is aware of agentic programs."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        num_queues: int = _NUM_QUEUES,
+        thresholds: Sequence[float] = tuple(_THRESHOLDS),
+        queue_quanta: Sequence[int] = _QUEUE_QUANTA,
+        beta: float = _BETA,
+        max_proactive_preemptions_per_step: int = _MAX_PROACTIVE_PREEMPTIONS_PER_STEP,
+        **kwargs: Any,
+    ) -> None:
         """Build the scheduler and self-configure priority ordering.
 
         Calls the base initialiser (``AsyncScheduler`` -> ``Scheduler``, which
         also sets up the async placeholder bookkeeping), then switches the
         scheduling policy to ``PRIORITY`` and rebuilds the waiting queues so that
         deploying with only ``--scheduler-cls ...PLASScheduler`` yields the right
-        ordering, and instantiates the Phase-0 policy core (process table,
-        attained-service tracker, MLFQ binner).
+        ordering, and instantiates the policy core (process table,
+        attained-service tracker, MLFQ binner + quantum machinery). The
+        constants default to the D5 / FastServe values and are accepted as
+        parameters so a ``beta`` / ``K`` ablation is possible.
+
+        Args:
+            num_queues: Number of priority levels ``K``.
+            thresholds: Cumulative service thresholds for arrival binning; must
+                have length ``num_queues - 1``.
+            queue_quanta: Per-level decode-step quantum; must have length
+                ``num_queues``.
+            beta: Anti-starvation wait-to-service ratio threshold.
+            max_proactive_preemptions_per_step: Upper bound on proactive
+                preemptions per ``schedule()`` call (0 disables it).
+
+        Raises:
+            ValueError: If the thresholds or quanta lengths do not match
+                ``num_queues``.
         """
         super().__init__(*args, **kwargs)
 
@@ -90,7 +123,13 @@ class PLASScheduler(AsyncScheduler):
 
         self.process_table = ProcessTable(ttl=_PROGRAM_TTL_S)
         self.attained_service = AttainedServiceTracker()
-        self.binner = MlfqBinner(num_queues=_NUM_QUEUES, thresholds=_THRESHOLDS)
+        self._init_policy_core(
+            num_queues=num_queues,
+            queue_quanta=tuple(queue_quanta),
+            beta=beta,
+            max_proactive_preemptions_per_step=max_proactive_preemptions_per_step,
+            binner=MlfqBinner(num_queues=num_queues, thresholds=list(thresholds)),
+        )
         # request_id -> program_id for the call's lifetime.
         self._req_to_pid: dict[str, str] = {}
 
@@ -112,35 +151,28 @@ class PLASScheduler(AsyncScheduler):
     def add_request(self, request: Request) -> None:
         """Bin a newly-arrived call by its program's service, then enqueue.
 
-        The priority is assigned before the base enqueues (and heapifies) the
-        request, so the call enters the waiting queue at its LAS bin.
+        The arrival level (and its quantum) is assigned before the base
+        enqueues (and heapifies) the request, so the call enters the waiting
+        queue at its LAS bin.
         """
         if request.request_id not in self.requests:
             program_id = self._program_id(request)
             state = self.process_table.get_or_create(program_id)
-            request.priority = self.binner.bin(state.service)
+            self._register_call_state(request, self.binner.bin(state.service))
             self.process_table.register_call(
                 program_id, request.request_id, request.arrival_time
             )
             self._req_to_pid[request.request_id] = program_id
         super().add_request(request)
 
-    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Accrue one unit of attained service per scheduled decode step.
+    def _on_service_step(self, req_id: str) -> None:
+        """Accrue one unit of attained service per charged decode step.
 
-        ``super()`` runs first: ``AsyncScheduler`` reserves output placeholders
-        and delegates to ``Scheduler``, which advances computed tokens and sets
-        ``is_prefill_chunk``. We then accrue on the final (non-prefill-chunk)
-        steps. The base async over-schedule guard means the number of such steps
-        stays exactly ``max_tokens``, so accrual is unchanged by run-ahead.
+        Called by the mixin's ``_update_after_schedule`` for exactly the steps
+        that also charge quantum (final, non-prefill-chunk steps), so the
+        program fold and the quantum/starvation windows stay in lockstep.
         """
-        super()._update_after_schedule(scheduler_output)
-        for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests.get(req_id)
-            # Skip non-final prefill chunks; the base sets `is_prefill_chunk`
-            # from the just-advanced computed-token count.
-            if request is not None and not request.is_prefill_chunk:
-                self.attained_service.record_step(req_id)
+        self.attained_service.record_step(req_id)
 
     def _fold_completed_calls(self, req_ids: Iterable[str], now: float) -> None:
         """Fold each finished call's attained service into its program.
@@ -158,6 +190,7 @@ class PLASScheduler(AsyncScheduler):
         for req_id in req_ids:
             program_id = self._req_to_pid.pop(req_id, None)
             service = self.attained_service.pop(req_id)
+            self._call_state.pop(req_id, None)
             if program_id is None:
                 continue
             self.process_table.add_service(program_id, service)
