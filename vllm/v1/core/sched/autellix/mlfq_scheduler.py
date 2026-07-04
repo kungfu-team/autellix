@@ -9,8 +9,8 @@ queue's decode-step quantum; a call that waits too long relative to its service
 is promoted back to Q1 (anti-starvation); and when the running batch is full a
 higher-priority waiting call proactively preempts the worst running call. This is
 the FastServe scheme the paper builds on, realised on the vLLM v1 engine by
-composing the pure-Python Phase-0 core (:class:`MlfqBinner`) with vLLM's native
-priority queue and recompute-based preemption.
+composing the shared quantum/promotion machinery (:class:`QuantumMlfqMixin`)
+with vLLM's native priority queue and recompute-based preemption.
 
 Mapping (see ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §3-5):
 
@@ -23,8 +23,11 @@ Mapping (see ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §3-5):
 * Service is proxied by decode steps: each scheduled decode step adds one unit
   (D4). No cumulative :class:`AttainedServiceTracker` is needed here because the
   per-call service window is the anti-starvation ``T`` and is reset on promotion.
-* All state is strictly **per call** (there is no process table); it is released
-  on both normal completion and external abort so nothing leaks.
+* All state is strictly **per call** (there is no process table); the
+  anti-starvation ratio uses the call-level windows alone (``W_c / max(1,
+  T_c)``), the paper's deliberately "naive" FastServe variant -- the mixin's
+  ``_program_windows`` default of ``(0, 0)``. State is released on both normal
+  completion and external abort so nothing leaks.
 
 Constants (POLICY_REFERENCE.md §4, decision D5): ``K = 7`` queues, per-queue
 decode-step quanta ``(1, 2, 4, 8, 16, 32, 64)`` (the paper's cited FastServe
@@ -32,22 +35,21 @@ geometric ×2 scheme), and anti-starvation ratio ``beta = 8.0``. They are expose
 as constructor parameters so a ``beta`` / ``K`` ablation is possible.
 
 Proactive preemption + thrash bound: v1 never preempts a running call to admit a
-higher-priority waiting one (it only preempts reactively on KV OOM), so MLFQ adds
-this in a bookkeeping pass run *before* delegating to ``super().schedule()``. To
-avoid preempt/recompute thrash it preempts at most
+higher-priority waiting one (it only preempts reactively on KV OOM), so the
+mixin adds this in a bookkeeping pass run *before* delegating to
+``super().schedule()``. To avoid preempt/recompute thrash it preempts at most
 ``max_proactive_preemptions_per_step`` calls per step (default 1, matching the
 paper's "preempt the worst running call"), and only ever the current worst
 running call while a waiting call *strictly* outranks it — so once the queues
 converge (no waiting call outranks any running call) preemption stops.
 """
 
-import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
+from vllm.v1.core.sched.autellix.policy_core import QuantumMlfqMixin
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.engine import EngineCoreOutputs
@@ -65,31 +67,11 @@ _BETA = 8.0
 _MAX_PROACTIVE_PREEMPTIONS_PER_STEP = 1
 
 
-@dataclass
-class _MlfqCallState:
-    """Mutable per-call MLFQ bookkeeping, keyed by ``request_id``.
-
-    Attributes:
-        queue_index: The call's current queue; equals ``request.priority`` (queue
-            0 is Q1, the highest priority).
-        quantum_remaining: Decode steps left before the call is demoted a level.
-        wait_window: Decode steps the call has waited (``W_call``); reset to 0 on
-            anti-starvation promotion.
-        service_window: Decode steps the call has been served (``T_call``); reset
-            to 0 on anti-starvation promotion.
-    """
-
-    queue_index: int
-    quantum_remaining: int
-    wait_window: int
-    service_window: int
-
-
-class MLFQScheduler(AsyncScheduler):
+class MLFQScheduler(QuantumMlfqMixin, AsyncScheduler):
     """FastServe-style preemptive MLFQ scheduler (program-agnostic).
 
     Subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
-    scheduling enabled; the MLFQ overrides compose with the async placeholder
+    scheduling enabled; the mixin's overrides compose with the async placeholder
     bookkeeping (``_update_after_schedule`` calls ``super()`` first, then charges
     quantum/service on the final decode steps), and in lockstep (sync) operation
     the placeholder churn nets to zero so behaviour is unchanged.
@@ -138,16 +120,16 @@ class MLFQScheduler(AsyncScheduler):
         self.waiting = create_request_queue(self.policy)
         self.skipped_waiting = create_request_queue(self.policy)
 
-        self.num_queues = num_queues
-        self.queue_quanta = tuple(queue_quanta)
-        self.beta = beta
-        self.max_proactive_preemptions_per_step = max_proactive_preemptions_per_step
         # Only demote / anti_starvation / outranks are used; MLFQ never bins by
         # service (every new call starts in Q1), so the binner's thresholds are
         # irrelevant here.
-        self.binner = MlfqBinner(num_queues=num_queues)
-        self._call_state: dict[str, _MlfqCallState] = {}
-        self.proactive_preemption_count = 0
+        self._init_policy_core(
+            num_queues=num_queues,
+            queue_quanta=tuple(queue_quanta),
+            beta=beta,
+            max_proactive_preemptions_per_step=max_proactive_preemptions_per_step,
+            binner=MlfqBinner(num_queues=num_queues),
+        )
 
     def add_request(self, request: Request) -> None:
         """Place every newly-arrived call in the top queue Q1 (priority 0).
@@ -156,146 +138,8 @@ class MLFQScheduler(AsyncScheduler):
         request, so the call enters the waiting queue at Q1.
         """
         if request.request_id not in self.requests:
-            request.priority = 0
-            self._call_state[request.request_id] = _MlfqCallState(
-                queue_index=0,
-                quantum_remaining=self.queue_quanta[0],
-                wait_window=0,
-                service_window=0,
-            )
+            self._register_call_state(request, queue_index=0)
         super().add_request(request)
-
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        """Run MLFQ bookkeeping, then delegate to the base scheduling loop.
-
-        The bookkeeping pass (anti-starvation promotion + proactive preemption)
-        mutates ``request.priority`` and the waiting heap so that the base loop,
-        which is unchanged, admits and evicts calls in MLFQ order.
-
-        Proactive preemptions happen before the base loop, so the base only
-        reports its own KV-pressure preemptions in ``preempted_req_ids``; the
-        proactive victims are merged in afterwards. The v2 model runner frees a
-        request's persistent-batch slot only for ids in ``finished_req_ids`` or
-        ``preempted_req_ids``, and a proactive preemption always happens at a
-        full batch whose vacated slot is immediately re-admitted — so an
-        unreported victim overflows the worker's ``max_num_reqs`` slots
-        ("No free indices"). The worker frees slots before adding new/resumed
-        requests, so reporting a victim resumed in this same step is safe.
-        """
-        now = time.monotonic()
-        self._accrue_wait_and_promote()
-        preempted_req_ids = self._proactively_preempt(now)
-        scheduler_output = super().schedule(throttle_prefills)
-        if preempted_req_ids:
-            if scheduler_output.preempted_req_ids is None:
-                scheduler_output.preempted_req_ids = preempted_req_ids
-            else:
-                scheduler_output.preempted_req_ids |= preempted_req_ids
-        return scheduler_output
-
-    def _accrue_wait_and_promote(self) -> None:
-        """Accrue wait for waiting calls and promote the starving ones to Q1.
-
-        Every call currently waiting (in either the main or the skipped queue)
-        accrues one unit of wait. A call outside Q1 whose ``W / max(1, T)`` has
-        reached ``beta`` is promoted to Q1 with its windows reset, and the queue
-        is re-heapified so the base loop sees the new ordering.
-        """
-        for queue in (self.waiting, self.skipped_waiting):
-            promoted: list[Request] = []
-            for request in list(queue):
-                # Every queued call was registered by add_request, so its state
-                # is present; a missing entry is a real invariant violation.
-                state = self._call_state[request.request_id]
-                state.wait_window += 1
-                if state.queue_index != 0 and self.binner.anti_starvation(
-                    state.wait_window, state.service_window, self.beta
-                ):
-                    self._promote_to_top(request, state)
-                    promoted.append(request)
-            if promoted:
-                # Priorities changed in place; re-insert to restore heap order.
-                queue.remove_requests(promoted)
-                for request in promoted:
-                    queue.add_request(request)
-
-    def _promote_to_top(self, request: Request, state: _MlfqCallState) -> None:
-        """Promote a starving call back to Q1 and reset its call-level windows."""
-        state.queue_index = 0
-        state.quantum_remaining = self.queue_quanta[0]
-        state.wait_window = 0
-        state.service_window = 0
-        request.priority = 0
-
-    def _proactively_preempt(self, now: float) -> set[str]:
-        """Preempt the worst running call(s) so better waiting calls can run.
-
-        Only fires when the batch is full. Each iteration preempts the current
-        worst running call while the best waiting call *strictly* outranks it,
-        up to ``max_proactive_preemptions_per_step`` times. Freed calls return to
-        the waiting queue (recompute-based, KV blocks freed) so the base loop can
-        admit the better waiting calls into the vacated slots. The strict-outrank
-        guard makes preemption stop once the queues converge, and the per-step
-        cap bounds recompute so it cannot thrash.
-
-        Returns:
-            The preempted request ids, to be merged into the step's
-            ``SchedulerOutput.preempted_req_ids`` (see ``schedule``).
-        """
-        preempted_req_ids: set[str] = set()
-        if len(self.running) < self.max_num_running_reqs:
-            return preempted_req_ids
-        while (
-            len(preempted_req_ids) < self.max_proactive_preemptions_per_step
-            and self.waiting
-            and self.running
-        ):
-            best_waiting = self.waiting.peek_request()
-            worst_running = max(
-                self.running, key=lambda r: (r.priority, r.arrival_time)
-            )
-            if not self.binner.outranks(best_waiting.priority, worst_running.priority):
-                break
-            self.running.remove(worst_running)
-            self._preempt_request(worst_running, now)
-            self.proactive_preemption_count += 1
-            preempted_req_ids.add(worst_running.request_id)
-        return preempted_req_ids
-
-    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Charge one decode step of quantum/service and demote on exhaustion.
-
-        ``super()`` (``AsyncScheduler`` -> ``Scheduler``) runs first to reserve
-        output placeholders and set ``is_prefill_chunk``. A running call whose
-        quantum is exhausted is then demoted one level and its priority updated in
-        place; this is correct even for a call already running (unlike PLAS, an
-        MLFQ call's queue is not fixed for its lifetime). Non-final prefill chunks
-        are not charged, and the base async over-schedule guard keeps the charge
-        at one unit per output token under run-ahead.
-        """
-        super()._update_after_schedule(scheduler_output)
-        for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests.get(req_id)
-            if request is None or request.is_prefill_chunk:
-                continue
-            # A scheduled call is always registered (see add_request).
-            state = self._call_state[req_id]
-            state.quantum_remaining -= 1
-            state.service_window += 1
-            if state.quantum_remaining <= 0:
-                state.queue_index = self.binner.demote(state.queue_index)
-                request.priority = state.queue_index
-                state.quantum_remaining = self.queue_quanta[state.queue_index]
-
-    def _release_call_state(self, req_ids: Iterable[str]) -> None:
-        """Drop each finished call's per-call state.
-
-        Idempotent per call (``pop`` with a default), so the two completion
-        paths -- ``update_from_output`` for normal stops and ``finish_requests``
-        for aborts -- never error on an already-released id.
-        """
-        for req_id in req_ids:
-            self._call_state.pop(req_id, None)
 
     def update_from_output(
         self,
