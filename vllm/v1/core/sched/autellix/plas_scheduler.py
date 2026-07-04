@@ -165,6 +165,20 @@ class PLASScheduler(QuantumMlfqMixin, AsyncScheduler):
             self._req_to_pid[request.request_id] = program_id
         super().add_request(request)
 
+    def _program_windows(self, request: Request) -> tuple[float, float]:
+        """Return the program's ``(W_p, T_p)`` for the starvation ratio.
+
+        ``W_p`` is the wait folded from the program's completed calls and
+        ``T_p`` is the PLAS sum-rule attained service, so promotion measures
+        **program-level** starvation (paper §4.2.2: a call-level-only ratio
+        "reduces Autellix to naive MLFQ").
+        """
+        program_id = self._req_to_pid.get(request.request_id)
+        state = self.process_table.get(program_id) if program_id else None
+        if state is None:
+            return (0.0, 0.0)
+        return (state.total_wait, state.service)
+
     def _on_service_step(self, req_id: str) -> None:
         """Accrue one unit of attained service per charged decode step.
 

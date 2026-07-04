@@ -580,6 +580,74 @@ def test_waiting_steps_fold_into_program_total_wait_on_abort():
 
 
 # --------------------------------------------------------------------------- #
+# Gate: program-level anti-starvation promotion (Algorithm 1 lines 25-31)
+# --------------------------------------------------------------------------- #
+
+
+def test_promotion_uses_program_level_windows():
+    """Promotion fires on (W_p + W_c) / max(1, T_p + T_c) >= beta, not W_c/T_c.
+
+    With W_p=20, T_p=3 and beta=8 the ratio crosses at W_c=4
+    ((20+4)/3 == 8), well before the call-level-only threshold (W_c=8 for
+    a zero-service call) -- proving the program windows are consulted.
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    program = scheduler.process_table.get_or_create("P")
+    program.service = 3.0  # T_p
+    program.total_wait = 20.0  # W_p
+
+    blocker = make_request("blk", program_id="B", max_tokens=500, arrival_time=0.0)
+    scheduler.add_request(blocker)
+    scheduler.schedule()  # admit the blocker so the P call stays waiting
+    call = make_request("p1", program_id="P", max_tokens=2, arrival_time=1.0)
+    scheduler.add_request(call)
+    assert call.priority == 1  # bin(3)
+
+    # W_c = 3: (20 + 3) / 3 = 7.67 < 8 -> not yet promoted.
+    for _ in range(3):
+        scheduler._accrue_wait_and_promote()
+    assert call.priority == 1
+
+    # W_c = 4: (20 + 4) / 3 = 8.0 >= 8 -> promoted to the top level.
+    scheduler._accrue_wait_and_promote()
+    assert call.priority == 0
+    assert scheduler.waiting.peek_request().request_id == "p1"
+
+
+def test_promotion_resets_only_call_level_windows():
+    """Promotion resets W_c/T_c but leaves the program's W_p/T_p intact.
+
+    Resetting the program windows would immediately re-starve the program's
+    other calls (paper §4.2.2); they must persist so sibling calls promote
+    together.
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    program = scheduler.process_table.get_or_create("P")
+    program.service = 3.0
+    program.total_wait = 20.0
+
+    blocker = make_request("blk", program_id="B", max_tokens=500, arrival_time=0.0)
+    scheduler.add_request(blocker)
+    scheduler.schedule()
+    call = make_request("p1", program_id="P", max_tokens=2, arrival_time=1.0)
+    scheduler.add_request(call)
+
+    for _ in range(4):  # drive past the beta threshold (see companion test)
+        scheduler._accrue_wait_and_promote()
+    state = scheduler._call_state["p1"]
+    assert call.priority == 0
+
+    # Call-level windows reset...
+    assert state.queue_index == 0
+    assert state.wait_window == 0
+    assert state.service_window == 0
+    assert state.quantum_remaining == scheduler.queue_quanta[0]
+    # ...program-level windows persist.
+    assert program.total_wait == 20.0
+    assert program.service == 3.0
+
+
+# --------------------------------------------------------------------------- #
 # Gate: externally-aborted calls are folded, not leaked
 # --------------------------------------------------------------------------- #
 
