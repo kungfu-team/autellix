@@ -652,6 +652,189 @@ def test_normal_completion_then_abort_does_not_double_fold():
 
 
 # --------------------------------------------------------------------------- #
+# Gate: quantum demotion (Algorithm 1 lines 21-24) layered on the arrival bin
+# --------------------------------------------------------------------------- #
+
+
+def test_call_demotes_after_exhausting_arrival_bin_quantum():
+    """The arrival bin (critical path) sets the level; quanta then demote it."""
+    scheduler = create_atlas_scheduler(max_num_seqs=1)
+    scheduler.process_table.get_or_create("Q").max_critical_path = 5.0
+
+    call = make_request("q1", program_id="Q", max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(call)
+    assert call.priority == 2  # bin(5)
+    assert scheduler._call_state["q1"].quantum_remaining == 4  # queue_quanta[2]
+
+    # Queue 2 quantum == 4: four decode steps demote to queue 3.
+    for _ in range(4):
+        _step(scheduler)
+    assert call.priority == 3
+    assert scheduler._call_state["q1"].quantum_remaining == 8  # queue_quanta[3]
+
+
+# --------------------------------------------------------------------------- #
+# Gate: wait accrual — a call's waited steps fold into the program's W_p
+# --------------------------------------------------------------------------- #
+
+
+def test_waiting_steps_fold_into_program_total_wait_on_completion():
+    """A call's accrued wait window folds into ProcessTable.total_wait (W_p)."""
+    scheduler = create_atlas_scheduler(max_num_seqs=1)
+    # Deep-critical-path waiter (bin 6): cannot outrank or promote past the
+    # fresh blocker within this test's horizon, so its wait is deterministic.
+    scheduler.process_table.get_or_create("W").max_critical_path = 100.0
+
+    blocker = make_request("blk", program_id="B", max_tokens=5, arrival_time=1.0)
+    waiter = make_request("w1", program_id="W", max_tokens=2, arrival_time=2.0)
+    scheduler.add_request(blocker)
+    scheduler.add_request(waiter)
+
+    for _ in range(5):  # blocker's 5 decode steps
+        _step(scheduler)
+    assert "blk" not in scheduler.requests
+    assert scheduler._call_state["w1"].wait_window == 5
+
+    _run_to_completion(scheduler, "w1")
+
+    assert scheduler.process_table.get("W").total_wait == 6.0  # 5 + admission pass
+
+
+# --------------------------------------------------------------------------- #
+# Gate: program-level anti-starvation promotion (Algorithm 1 lines 25-31)
+# --------------------------------------------------------------------------- #
+
+
+def test_promotion_uses_critical_path_program_windows():
+    """Promotion fires on (W_p + W_c) / max(1, T_p + T_c) with T_p = max rule.
+
+    With W_p=20, T_p=max_critical_path=3 and beta=8 the ratio crosses at
+    W_c=4 ((20+4)/3 == 8), well before the call-level-only threshold (W_c=8
+    for a zero-service call) -- proving ATLAS consults the critical-path
+    program windows.
+    """
+    scheduler = create_atlas_scheduler(max_num_seqs=1)
+    program = scheduler.process_table.get_or_create("P")
+    program.max_critical_path = 3.0  # T_p (ATLAS max rule)
+    program.total_wait = 20.0  # W_p
+
+    blocker = make_request("blk", program_id="B", max_tokens=500, arrival_time=0.0)
+    scheduler.add_request(blocker)
+    scheduler.schedule()  # admit the blocker so the P call stays waiting
+    call = make_request("p1", program_id="P", max_tokens=2, arrival_time=1.0)
+    scheduler.add_request(call)
+    assert call.priority == 1  # bin(3)
+
+    # W_c = 3: (20 + 3) / 3 = 7.67 < 8 -> not yet promoted.
+    for _ in range(3):
+        scheduler._accrue_wait_and_promote()
+    assert call.priority == 1
+
+    # W_c = 4: (20 + 4) / 3 = 8.0 >= 8 -> promoted to the top level.
+    scheduler._accrue_wait_and_promote()
+    assert call.priority == 0
+
+    # Call-level windows reset; program-level windows persist (paper §4.2.2).
+    state = scheduler._call_state["p1"]
+    assert state.wait_window == 0
+    assert state.service_window == 0
+    assert state.quantum_remaining == scheduler.queue_quanta[0]
+    assert program.total_wait == 20.0
+    assert program.max_critical_path == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Gate: proactive preemption is REPORTED to the model runner (slot invariant)
+# --------------------------------------------------------------------------- #
+
+
+def test_proactive_preemption_is_reported_in_scheduler_output():
+    """A proactively preempted call must appear in ``preempted_req_ids``.
+
+    Same invariant as MLFQ/PLAS: the v2 model runner frees persistent-batch
+    slots only for ids in ``finished_req_ids`` or ``preempted_req_ids``; an
+    unreported proactive victim leaks a slot and kills the engine with
+    "No free indices".
+    """
+    scheduler = create_atlas_scheduler(max_num_seqs=1)
+    low = make_request("low", program_id="OLD", max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(low)
+    for _ in range(7):  # demote the running call below the top level
+        _step(scheduler)
+    assert low.priority == 3
+    assert low.status == RequestStatus.RUNNING
+
+    high = make_request("high", program_id="NEW", max_tokens=5, arrival_time=8.0)
+    scheduler.add_request(high)
+    assert high.priority == 0
+
+    output = scheduler.schedule()
+
+    assert scheduler.requests["low"].status == RequestStatus.PREEMPTED
+    assert "low" in (output.preempted_req_ids or set())
+    assert scheduler.proactive_preemption_count == 1
+
+
+def test_v2_worker_slot_accounting_never_overflows_under_churn():
+    """Simulated v2-worker slot occupancy never exceeds ``max_num_seqs``.
+
+    Mirrors ``gpu/model_runner.py`` order of operations per step: free slots
+    for ``finished_req_ids | preempted_req_ids``, then (re-)add slots for
+    ``scheduled_new_reqs``. Sustained fresh-program arrivals against a full
+    batch of demoted calls keeps the proactive-preemption path hot.
+    """
+    max_num_seqs = 2
+    scheduler = create_atlas_scheduler(max_num_seqs=max_num_seqs)
+    scheduler.use_v2_model_runner = True
+
+    slots: set[str] = set()
+
+    def step_with_slot_accounting(token: int = 100) -> None:
+        output = scheduler.schedule()
+        freed = output.finished_req_ids | (output.preempted_req_ids or set())
+        for req_id in freed:
+            slots.discard(req_id)
+        for new_req in output.scheduled_new_reqs:
+            slots.add(new_req.req_id)
+        assert len(slots) <= max_num_seqs, (
+            f"worker slot overflow: {sorted(slots)} exceeds {max_num_seqs}"
+        )
+        req_ids = list(output.num_scheduled_tokens.keys())
+        sampled = [
+            [token] if not scheduler.requests[rid].is_prefill_chunk else []
+            for rid in req_ids
+        ]
+        model_output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        scheduler.update_from_output(output, model_output)
+
+    for i in range(2):
+        scheduler.add_request(
+            make_request(
+                f"long{i}", program_id="LONG", max_tokens=400, arrival_time=0.0
+            )
+        )
+    for _ in range(8):  # demote the long calls so fresh programs outrank them
+        step_with_slot_accounting()
+
+    for i in range(200):
+        scheduler.add_request(
+            make_request(
+                f"f{i}", program_id=f"P{i}", max_tokens=2, arrival_time=8.0 + i
+            )
+        )
+        step_with_slot_accounting()
+
+    assert scheduler.proactive_preemption_count > 0
+
+
+# --------------------------------------------------------------------------- #
 # Decode-step proxy under chunked prefill
 # --------------------------------------------------------------------------- #
 
