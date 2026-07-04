@@ -648,6 +648,120 @@ def test_promotion_resets_only_call_level_windows():
 
 
 # --------------------------------------------------------------------------- #
+# Gate: proactive preemption fires, is bounded, and is REPORTED to the runner
+# --------------------------------------------------------------------------- #
+
+
+def test_proactive_preemption_admits_less_served_program_call():
+    """A fresh program's call preempts a demoted running call at a full batch."""
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    low = make_request("low", program_id="OLD", max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(low)
+    for _ in range(7):  # demote the running call to queue 3
+        _step(scheduler)
+    assert low.priority == 3
+    assert [r.request_id for r in scheduler.running] == ["low"]
+
+    high = make_request("high", program_id="NEW", max_tokens=5, arrival_time=8.0)
+    scheduler.add_request(high)
+    assert high.priority == 0
+
+    output = scheduler.schedule()
+
+    assert scheduler.requests["low"].status == RequestStatus.PREEMPTED
+    assert any(r.req_id == "high" for r in output.scheduled_new_reqs)
+    assert scheduler.proactive_preemption_count == 1
+
+
+def test_proactive_preemption_is_reported_in_scheduler_output():
+    """A proactively preempted call must appear in ``preempted_req_ids``.
+
+    The v2 model runner frees a request's persistent-batch slot only for ids in
+    ``finished_req_ids`` or ``preempted_req_ids``
+    (``gpu/model_runner.py::finish_requests``); the base loop reports only its
+    own KV-pressure preemptions. An unreported proactive preemption therefore
+    leaks a worker slot, and since proactive preemption fires only at a full
+    batch — where the vacated slot is immediately re-admitted — occupancy
+    overflows ``max_num_reqs`` and the engine dies with "No free indices".
+    """
+    scheduler = create_plas_scheduler(max_num_seqs=1)
+    low = make_request("low", program_id="OLD", max_tokens=200, arrival_time=1.0)
+    scheduler.add_request(low)
+    for _ in range(7):  # demote the running call below the top level
+        _step(scheduler)
+    assert low.status == RequestStatus.RUNNING
+
+    high = make_request("high", program_id="NEW", max_tokens=5, arrival_time=8.0)
+    scheduler.add_request(high)
+
+    output = scheduler.schedule()
+
+    assert scheduler.requests["low"].status == RequestStatus.PREEMPTED
+    assert "low" in (output.preempted_req_ids or set())
+
+
+def test_v2_worker_slot_accounting_never_overflows_under_churn():
+    """Simulated v2-worker slot occupancy never exceeds ``max_num_seqs``.
+
+    Mirrors ``gpu/model_runner.py`` order of operations per step: free slots
+    for ``finished_req_ids | preempted_req_ids``, then (re-)add slots for
+    ``scheduled_new_reqs`` (which, for the v2 runner, also carries resumed
+    calls). Sustained fresh-program arrivals against a full batch of demoted
+    calls keeps the proactive-preemption path hot the whole run.
+    """
+    max_num_seqs = 2
+    scheduler = create_plas_scheduler(max_num_seqs=max_num_seqs)
+    # Fold resumed calls into scheduled_new_reqs, as the v2 runner expects.
+    scheduler.use_v2_model_runner = True
+
+    slots: set[str] = set()
+
+    def step_with_slot_accounting(token: int = 100) -> None:
+        output = scheduler.schedule()
+        freed = output.finished_req_ids | (output.preempted_req_ids or set())
+        for req_id in freed:
+            slots.discard(req_id)
+        for new_req in output.scheduled_new_reqs:
+            slots.add(new_req.req_id)
+        assert len(slots) <= max_num_seqs, (
+            f"worker slot overflow: {sorted(slots)} exceeds {max_num_seqs}"
+        )
+        req_ids = list(output.num_scheduled_tokens.keys())
+        sampled = [
+            [token] if not scheduler.requests[rid].is_prefill_chunk else []
+            for rid in req_ids
+        ]
+        model_output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        scheduler.update_from_output(output, model_output)
+
+    for i in range(2):
+        scheduler.add_request(
+            make_request(
+                f"long{i}", program_id="LONG", max_tokens=400, arrival_time=0.0
+            )
+        )
+    for _ in range(8):  # demote the long calls so fresh programs outrank them
+        step_with_slot_accounting()
+
+    for i in range(200):
+        scheduler.add_request(
+            make_request(
+                f"f{i}", program_id=f"P{i}", max_tokens=2, arrival_time=8.0 + i
+            )
+        )
+        step_with_slot_accounting()
+
+    assert scheduler.proactive_preemption_count > 0
+
+
+# --------------------------------------------------------------------------- #
 # Gate: externally-aborted calls are folded, not leaked
 # --------------------------------------------------------------------------- #
 
